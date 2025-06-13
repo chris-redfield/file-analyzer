@@ -53,6 +53,7 @@ class Config:
     process_text: bool = True
     process_pdfs: bool = True  # NEW: Enable PDF processing by default
     pdf_max_pages: int = 10  # NEW: Maximum pages to process per PDF
+    max_tokens: int = 500  # NEW: Maximum tokens for AI responses
     save_incremental: bool = True  # Save results after each batch
     
     def __post_init__(self):
@@ -654,14 +655,22 @@ class FileProcessor:
             if len(content) > 4000:
                 content = content[:4000] + "... [truncated]"
             
-            prompt = f"""Analyze this text file and provide:
+            filename = os.path.basename(file_info.path)
+            file_extension = Path(file_info.path).suffix.lower()
+            
+            prompt = f"""You are analyzing a text file. Please provide a comprehensive analysis.
+
+FILENAME: {filename}
+FILE TYPE: {file_extension} text file
+FILE SIZE: {file_info.size} bytes
+
+TASK: Analyze this file and provide:
 1. A brief summary of what this file is about (1-2 sentences)
 2. Main topics and themes (as tags)
 3. Any mentioned locations
 4. Important entities (people, organizations, etc.)
 
-File: {os.path.basename(file_info.path)}
-Content:
+CONTENT:
 {content}
 
 Respond in JSON format:
@@ -693,14 +702,22 @@ Respond in JSON format:
             if len(extracted_text) > 6000:
                 extracted_text = extracted_text[:6000] + "... [truncated]"
             
-            prompt = f"""Analyze this PDF document and provide:
+            filename = os.path.basename(file_info.path)
+            
+            prompt = f"""You are analyzing a PDF document. Please provide a comprehensive analysis.
+
+FILENAME: {filename}
+FILE TYPE: PDF document
+FILE SIZE: {file_info.size} bytes
+PAGES PROCESSED: Up to {self.config.pdf_max_pages} pages
+
+TASK: Analyze this PDF document and provide:
 1. A brief summary of what this document is about (1-2 sentences)
 2. Main topics and themes (as tags)
 3. Any mentioned locations
 4. Important entities (people, organizations, etc.)
 
-PDF File: {os.path.basename(file_info.path)}
-Content:
+EXTRACTED CONTENT:
 {extracted_text}
 
 Respond in JSON format:
@@ -803,19 +820,30 @@ Respond in JSON format:
             with open(file_info.path, 'rb') as f:
                 image_data = base64.b64encode(f.read()).decode('utf-8')
             
-            prompt = """Analyze this image and provide:
+            filename = os.path.basename(file_info.path)
+            file_extension = Path(file_info.path).suffix.lower()
+            
+            prompt = f"""You are analyzing an image file. Please provide a comprehensive analysis.
+
+FILENAME: {filename}
+FILE TYPE: {file_extension} image file
+FILE SIZE: {file_info.size} bytes
+
+TASK: Analyze this image and provide:
 1. A brief summary describing what you see in the image (1-2 sentences)
 2. What objects, people, or scenes do you see? (as tags)
 3. Any locations you can identify or geographical features
 4. Entities like people, brands, text, or organizations visible
 
+Please be specific and descriptive in your analysis.
+
 Respond in JSON format:
-{
+{{
     "summary": "Brief description of what this image shows",
     "tags": ["tag1", "tag2"],
     "locations": ["location1", "location2"],
     "entities": ["entity1", "entity2"]
-}"""
+}}"""
             
             result = self._call_ai_model(prompt, is_vision=True, image_data=image_data)
             self._parse_ai_response(file_info, result)
@@ -837,7 +865,10 @@ Respond in JSON format:
         payload = {
             "model": self.config.ollama_model,
             "prompt": prompt,
-            "stream": False
+            "stream": False,
+            "options": {
+                "num_predict": self.config.max_tokens  # Ollama uses num_predict for max tokens
+            }
         }
         
         if is_vision and image_data:
@@ -887,7 +918,7 @@ Respond in JSON format:
         response = openai.ChatCompletion.create(
             model=self.config.openai_model,
             messages=messages,
-            max_tokens=500
+            max_tokens=self.config.max_tokens  # Use configurable max_tokens
         )
         
         return response.choices[0].message.content
@@ -902,18 +933,61 @@ Respond in JSON format:
             if json_match:
                 result = json.loads(json_match.group())
                 file_info.summary = result.get('summary', 'No summary provided')
-                file_info.tags = result.get('tags', [])
-                file_info.locations = result.get('locations', [])
-                file_info.entities = result.get('entities', [])
+                
+                # Safely extract and validate lists
+                file_info.tags = self._extract_string_list(result.get('tags', []))
+                file_info.locations = self._extract_string_list(result.get('locations', []))
+                file_info.entities = self._extract_string_list(result.get('entities', []))
             else:
                 # Fallback: treat as simple text response
-                file_info.summary = response[:200] if response else "No summary available"  # Limit to 200 chars
+                file_info.summary = response[:200] if response else "No summary available"
                 file_info.tags = ["processed"]
                 
         except json.JSONDecodeError:
             # Fallback for non-JSON responses
             file_info.summary = response[:200] if response else "Processing completed"
             file_info.tags = ["processed"]
+        except Exception as e:
+            # Handle any other parsing errors
+            self.logger.debug(f"Error parsing AI response: {e}")
+            file_info.summary = "Processing completed with parsing issues"
+            file_info.tags = ["processed"]
+    
+    def _extract_string_list(self, data) -> List[str]:
+        """Extract a list of strings from various data formats"""
+        if not data:
+            return []
+        
+        # If it's already a list of strings, return as-is
+        if isinstance(data, list):
+            result = []
+            for item in data:
+                if isinstance(item, str):
+                    result.append(item.strip())
+                elif isinstance(item, dict):
+                    # Try to extract string value from dict
+                    if 'name' in item:
+                        result.append(str(item['name']).strip())
+                    elif 'value' in item:
+                        result.append(str(item['value']).strip())
+                    elif len(item) == 1:
+                        # Single key-value pair
+                        result.append(str(list(item.values())[0]).strip())
+                    else:
+                        # Convert entire dict to string as fallback
+                        result.append(str(item))
+                else:
+                    # Convert other types to string
+                    result.append(str(item).strip())
+            return [r for r in result if r]  # Remove empty strings
+        
+        # If it's a single string, return as list
+        elif isinstance(data, str):
+            return [data.strip()] if data.strip() else []
+        
+        # For anything else, convert to string
+        else:
+            return [str(data).strip()] if str(data).strip() else []
     
     def save_results(self) -> None:
         """Save final processing results"""
@@ -995,6 +1069,7 @@ def main():
         process_text=os.getenv('PROCESS_TEXT', 'true').lower() == 'true',
         process_pdfs=os.getenv('PROCESS_PDFS', 'true').lower() == 'true',
         pdf_max_pages=int(os.getenv('PDF_MAX_PAGES', 10)),
+        max_tokens=int(os.getenv('MAX_TOKENS', 500)),  # NEW: Configurable max tokens
         save_incremental=os.getenv('SAVE_INCREMENTAL', 'true').lower() == 'true'
     )
     
@@ -1020,6 +1095,7 @@ def main():
             processor.logger.info(f"📄 Processing file types: {', '.join(enabled_types)}")
             if config.process_pdfs:
                 processor.logger.info(f"📑 PDF processing: max {config.pdf_max_pages} pages per document")
+            processor.logger.info(f"🎯 AI model max tokens: {config.max_tokens}")
         
         processor.discover_files()
         processor.process_files()
