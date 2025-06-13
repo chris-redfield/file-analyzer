@@ -1,0 +1,14 @@
+# Core dependencies
+python-dotenv>=1.0.0
+requests>=2.31.0
+pillow>=10.0.0
+python-magic>=0.4.27
+
+# OpenAI API (optional, for OpenAI mode)
+openai>=1.0.0
+
+# Additional utilities
+pathlib2>=2.3.7; python_version < '3.4'
+
+# Development/Optional
+tqdm>=4.66.0  # For progress bars (optional enhancement)
