@@ -38,13 +38,14 @@ load_dotenv()
 class Config:
     """Configuration settings for the file processor"""
     ollama_url: str = "http://localhost:11434"
-    ollama_model: str = "llama3.2-vision"  # Model that supports vision
+    ollama_model: str = "gemma3"  # Model that supports vision
     openai_api_key: str = ""
     openai_model: str = "gpt-4o"
     use_ollama: bool = True
     max_file_size: int = 50 * 1024 * 1024  # 50MB
     batch_size: int = 5
     priority_folders: List[str] = None
+    skip_folders: List[str] = None  # NEW: Folders to skip
     output_dir: str = "ai_processing_results"
     log_level: str = "INFO"
     process_images: bool = False  # DISABLE IMAGE PROCESSING BY DEFAULT
@@ -54,16 +55,31 @@ class Config:
     def __post_init__(self):
         if self.priority_folders is None:
             self.priority_folders = [
-                "~/Screenshots/",
                 "~/Downloads/", 
                 "~/Documents/",
                 "~/Pictures/"
+            ]
+        
+        if self.skip_folders is None:
+            self.skip_folders = [
+                ".git",
+                ".cache",
+                "node_modules",
+                "__pycache__",
+                ".thumbnails",
+                "Cache",
+                ".local/share/Trash"
             ]
         
         # Handle custom priority folders from environment
         env_folders = os.getenv('PRIORITY_FOLDERS')
         if env_folders:
             self.priority_folders = [folder.strip() for folder in env_folders.split(',')]
+        
+        # Handle custom skip folders from environment
+        env_skip = os.getenv('SKIP_FOLDERS')
+        if env_skip:
+            self.skip_folders = [folder.strip() for folder in env_skip.split(',')]
         
         # Expand user paths
         self.priority_folders = [os.path.expanduser(folder) for folder in self.priority_folders]
@@ -204,6 +220,10 @@ class FileProcessor:
         """Discover files in priority folders only"""
         self.logger.info("Starting file discovery in priority folders...")
         
+        # Log what will be skipped
+        if self.config.skip_folders:
+            self.logger.info(f"⏭️  Will skip folders containing: {', '.join(self.config.skip_folders)}")
+        
         # Only scan priority folders
         for i, folder in enumerate(self.config.priority_folders):
             if os.path.exists(folder):
@@ -214,15 +234,52 @@ class FileProcessor:
         
         self.logger.info(f"Discovered {len(self.file_index)} files in priority folders")
     
+    def _should_skip_path(self, path: str) -> bool:
+        """Check if a path should be skipped based on skip_folders configuration"""
+        if not self.config.skip_folders:
+            return False
+        
+        # Normalize path for comparison
+        path_lower = path.lower()
+        
+        # Check if any skip folder is in the path
+        for skip_folder in self.config.skip_folders:
+            skip_folder_lower = skip_folder.lower()
+            
+            # Check if the skip folder appears anywhere in the path
+            if skip_folder_lower in path_lower:
+                # Make sure it's a complete folder name, not just a substring
+                # This prevents skipping "my_dataset_file.txt" when trying to skip "dataset"
+                import os
+                path_parts = path_lower.split(os.sep)
+                if any(skip_folder_lower == part or skip_folder_lower in part for part in path_parts):
+                    return True
+        
+        return False
+    
     def _scan_directory(self, directory: str, priority: int = 0) -> None:
         """Scan a specific directory"""
         try:
+            # Check if the directory itself should be skipped
+            if self._should_skip_path(directory):
+                self.logger.debug(f"Skipping directory: {directory}")
+                return
+            
             file_count = 0
+            skipped_dirs = []
+            
             for root, dirs, files in os.walk(directory):
-                # Skip hidden directories and common system/cache directories
-                dirs[:] = [d for d in dirs if not d.startswith('.') and 
-                          d not in ['node_modules', '__pycache__', '.git', '.cache', 
-                                   'Cache', 'cache', '.thumbnails', '.local/share/Trash']]
+                # Filter out directories that should be skipped
+                original_dirs = dirs[:]
+                dirs[:] = []
+                
+                for d in original_dirs:
+                    full_dir_path = os.path.join(root, d)
+                    if self._should_skip_path(full_dir_path):
+                        skipped_dirs.append(full_dir_path)
+                        self.logger.debug(f"Skipping subdirectory: {full_dir_path}")
+                    elif not d.startswith('.'):  # Also skip hidden directories
+                        dirs.append(d)
                 
                 for file in files:
                     # Skip hidden files and common cache/temp files
@@ -230,6 +287,12 @@ class FileProcessor:
                         continue
                         
                     filepath = os.path.join(root, file)
+                    
+                    # Check if the file path should be skipped
+                    if self._should_skip_path(filepath):
+                        self.logger.debug(f"Skipping file: {filepath}")
+                        continue
+                    
                     file_info = self._get_file_info(filepath, priority=priority)
                     if file_info:
                         self.file_index.append(file_info)
@@ -238,8 +301,16 @@ class FileProcessor:
                         # Log progress every 100 files
                         if file_count % 100 == 0:
                             self.logger.debug(f"Found {file_count} files in {directory}")
-                            
+            
+            # Log results for this directory
             self.logger.info(f"Found {file_count} files in {directory}")
+            if skipped_dirs:
+                self.logger.info(f"Skipped {len(skipped_dirs)} subdirectories in {directory}")
+                if self.config.log_level == 'DEBUG':
+                    for skipped in skipped_dirs[:5]:  # Show first 5 skipped dirs
+                        self.logger.debug(f"  Skipped: {skipped}")
+                    if len(skipped_dirs) > 5:
+                        self.logger.debug(f"  ... and {len(skipped_dirs) - 5} more")
                             
         except (PermissionError, OSError) as e:
             self.logger.debug(f"Cannot access {directory}: {e}")
@@ -736,7 +807,7 @@ def main():
     # Load configuration from environment
     config = Config(
         ollama_url=os.getenv('OLLAMA_URL', 'http://localhost:11434'),
-        ollama_model=os.getenv('OLLAMA_MODEL', 'llama3.2-vision'),
+        ollama_model=os.getenv('OLLAMA_MODEL', 'gemma3'),
         openai_api_key=os.getenv('OPENAI_API_KEY', ''),
         openai_model=os.getenv('OPENAI_MODEL', 'gpt-4o'),
         use_ollama=os.getenv('USE_OLLAMA', 'true').lower() == 'true',
@@ -753,6 +824,11 @@ def main():
     
     try:
         processor.logger.info("Starting AI File Processor")
+        
+        # Log skip folders for user awareness
+        if config.skip_folders:
+            processor.logger.info(f"⏭️  Skipping folders containing: {', '.join(config.skip_folders)}")
+        
         processor.discover_files()
         processor.process_files()
         processor.logger.info("Processing completed successfully")
