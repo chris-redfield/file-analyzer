@@ -12,3 +12,5 @@ pathlib2>=2.3.7; python_version < '3.4'
 
 # Development/Optional
 tqdm>=4.66.0  # For progress bars (optional enhancement)
+
+pdfplumber

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AI File Processor - Automated file analysis using GenAI models
-Supports both Ollama (local) and OpenAI API for processing text files and images
+Supports both Ollama (local) and OpenAI API for processing text files, PDFs, and images
 """
 
 import os
@@ -25,9 +25,10 @@ try:
     import openai
     from PIL import Image
     import magic  # python-magic for file type detection
+    import pdfplumber  # PDF text extraction
 except ImportError as e:
     print(f"Missing required package: {e}")
-    print("Install with: pip install python-dotenv openai pillow python-magic")
+    print("Install with: pip install python-dotenv openai pillow python-magic pdfplumber")
     exit(1)
 
 # Load environment variables
@@ -45,11 +46,13 @@ class Config:
     max_file_size: int = 50 * 1024 * 1024  # 50MB
     batch_size: int = 5
     priority_folders: List[str] = None
-    skip_folders: List[str] = None  # NEW: Folders to skip
+    skip_folders: List[str] = None  # Folders to skip
     output_dir: str = "ai_processing_results"
     log_level: str = "INFO"
     process_images: bool = False  # DISABLE IMAGE PROCESSING BY DEFAULT
     process_text: bool = True
+    process_pdfs: bool = True  # NEW: Enable PDF processing by default
+    pdf_max_pages: int = 10  # NEW: Maximum pages to process per PDF
     save_incremental: bool = True  # Save results after each batch
     
     def __post_init__(self):
@@ -97,7 +100,7 @@ class FileInfo:
     tags: List[str] = None
     entities: List[str] = None
     locations: List[str] = None
-    summary: str = ""  # NEW: AI-generated summary of the file
+    summary: str = ""  # AI-generated summary of the file
     error: str = ""
     
     def __post_init__(self):
@@ -151,7 +154,7 @@ class FileProcessor:
                 if self.config.ollama_model in model_names:
                     return True
                 
-                # Check for partial match (e.g., llama3.2-vision might be stored as llama3.2-vision:latest)
+                # Check for partial match (e.g., gemma3 might be stored as gemma3:latest)
                 if any(self.config.ollama_model in name for name in model_names):
                     return True
                 
@@ -405,6 +408,10 @@ class FileProcessor:
         if extension in text_extensions or any(mime_type.startswith(mime) for mime in text_mimes):
             return 'text'
         
+        # PDF files
+        if extension == '.pdf' or mime_type == 'application/pdf':
+            return 'pdf'
+        
         # Image files
         image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp', '.svg'}
         if extension in image_extensions or mime_type.startswith('image/'):
@@ -432,6 +439,8 @@ class FileProcessor:
             enabled_types.append('text')
         if self.config.process_images:
             enabled_types.append('image')
+        if self.config.process_pdfs:
+            enabled_types.append('pdf')
         
         if not enabled_types:
             self.logger.warning("No file types enabled for processing!")
@@ -454,6 +463,11 @@ class FileProcessor:
             text_files = [f for f in self.file_index if f.file_type == 'text']
             if text_files:
                 self.logger.info(f"Skipping {len(text_files)} text files (text processing disabled)")
+        
+        if not self.config.process_pdfs:
+            pdf_files = [f for f in self.file_index if f.file_type == 'pdf']
+            if pdf_files:
+                self.logger.info(f"Skipping {len(pdf_files)} PDF files (PDF processing disabled)")
         
         # Sort by priority (higher first), then by file type for batching
         processable_files.sort(key=lambda x: (-x.priority, x.file_type))
@@ -482,6 +496,9 @@ class FileProcessor:
         
         self.organize_processing_queue()
         
+        # Save initial state (discovered files, not yet processed)
+        self._save_initial_results()
+        
         # Group files by type for batch processing
         file_groups = {}
         for file_info in self.processing_queue:
@@ -494,8 +511,88 @@ class FileProcessor:
             self.logger.info(f"Processing {len(files)} {file_type} files")
             self._process_file_batch(files, file_type)
         
-        # Save results
+        # Save final results
         self.save_results()
+    
+    def _save_initial_results(self) -> None:
+        """Save initial discovered files before processing starts"""
+        try:
+            results = {
+                'processing_date': datetime.now().isoformat(),
+                'config': asdict(self.config),
+                'summary': {
+                    'total_files_discovered': len(self.file_index),
+                    'files_processed': 0,
+                    'files_with_summaries': 0,
+                    'encrypted_files_found': len([f for f in self.file_index if f.is_encrypted]),
+                    'errors': 0,
+                    'status': 'started'  # Indicate processing just started
+                },
+                'files': [asdict(file_info) for file_info in self.file_index]
+            }
+            
+            # Save initial results
+            results_file = os.path.join(self.config.output_dir, 'processing_results.json')
+            with open(results_file, 'w') as f:
+                json.dump(results, f, indent=2)
+            
+            # Save initial CSV (empty summaries, but shows discovered files)
+            self._save_csv_summary()
+            
+            self.logger.info(f"📋 Initial results saved - you can monitor progress at:")
+            self.logger.info(f"   CSV: {self.config.output_dir}/summary.csv")
+            self.logger.info(f"   JSON: {self.config.output_dir}/processing_results.json")
+            
+        except Exception as e:
+            self.logger.warning(f"Could not save initial results: {e}")
+    
+    def _save_incremental_results(self) -> None:
+        """Save current processing results after each batch"""
+        try:
+            # Update CSV with current results
+            self._save_csv_summary()
+            
+            # Also update JSON with current state
+            results = {
+                'processing_date': datetime.now().isoformat(),
+                'config': asdict(self.config),
+                'summary': {
+                    'total_files_discovered': len(self.file_index),
+                    'files_processed': len([f for f in self.file_index if f.processed]),
+                    'files_with_summaries': len([f for f in self.file_index if f.summary and f.summary.strip()]),
+                    'encrypted_files_found': len([f for f in self.file_index if f.is_encrypted]),
+                    'errors': len([f for f in self.file_index if f.error]),
+                    'status': 'processing'  # Indicate this is an incremental save
+                },
+                'files': [asdict(file_info) for file_info in self.file_index]
+            }
+            
+            # Save incremental JSON results
+            results_file = os.path.join(self.config.output_dir, 'processing_results.json')
+            with open(results_file, 'w') as f:
+                json.dump(results, f, indent=2)
+            
+            # Log progress
+            processed_count = len([f for f in self.file_index if f.processed])
+            
+            # Calculate total processable files based on enabled types
+            enabled_types = []
+            if self.config.process_text:
+                enabled_types.append('text')
+            if self.config.process_images:
+                enabled_types.append('image')
+            if self.config.process_pdfs:
+                enabled_types.append('pdf')
+            
+            total_processable = len([f for f in self.file_index 
+                                   if f.file_type in enabled_types and not f.is_encrypted])
+            
+            if total_processable > 0:
+                progress_pct = (processed_count / total_processable) * 100
+                self.logger.info(f"📊 Progress: {processed_count}/{total_processable} files ({progress_pct:.1f}%) - Results updated")
+                
+        except Exception as e:
+            self.logger.warning(f"Could not save incremental results: {e}")
     
     def _process_file_batch(self, files: List[FileInfo], file_type: str) -> None:
         """Process a batch of files of the same type"""
@@ -526,6 +623,8 @@ class FileProcessor:
                     self._process_text_file(file_info)
                 elif file_type == 'image':
                     self._process_image_file(file_info)
+                elif file_type == 'pdf':
+                    self._process_pdf_file(file_info)
                 
                 file_info.processed = True
                 
@@ -578,6 +677,120 @@ Respond in JSON format:
             
         except Exception as e:
             raise Exception(f"Text processing error: {e}")
+    
+    def _process_pdf_file(self, file_info: FileInfo) -> None:
+        """Process a PDF file"""
+        try:
+            # Extract text from PDF
+            extracted_text = self._extract_pdf_text(file_info.path)
+            
+            if not extracted_text or len(extracted_text.strip()) == 0:
+                file_info.summary = "PDF document with no extractable text (may be image-based)"
+                file_info.tags = ["pdf", "no-text"]
+                return
+            
+            # Truncate very long content (keep more for PDFs as they tend to be documents)
+            if len(extracted_text) > 6000:
+                extracted_text = extracted_text[:6000] + "... [truncated]"
+            
+            prompt = f"""Analyze this PDF document and provide:
+1. A brief summary of what this document is about (1-2 sentences)
+2. Main topics and themes (as tags)
+3. Any mentioned locations
+4. Important entities (people, organizations, etc.)
+
+PDF File: {os.path.basename(file_info.path)}
+Content:
+{extracted_text}
+
+Respond in JSON format:
+{{
+    "summary": "Brief description of what this PDF document contains",
+    "tags": ["tag1", "tag2"],
+    "locations": ["location1", "location2"],
+    "entities": ["entity1", "entity2"]
+}}"""
+            
+            result = self._call_ai_model(prompt, is_vision=False)
+            self._parse_ai_response(file_info, result)
+            
+        except Exception as e:
+            raise Exception(f"PDF processing error: {e}")
+    
+    def _extract_pdf_text(self, pdf_path: str) -> str:
+        """Extract text content from PDF file"""
+        try:
+            text_content = []
+            pages_processed = 0
+            
+            with pdfplumber.open(pdf_path) as pdf:
+                total_pages = len(pdf.pages)
+                max_pages = min(total_pages, self.config.pdf_max_pages)
+                
+                self.logger.debug(f"PDF has {total_pages} pages, processing first {max_pages}")
+                
+                for page_num, page in enumerate(pdf.pages[:max_pages]):
+                    try:
+                        page_text = page.extract_text()
+                        if page_text and page_text.strip():
+                            # Clean up the text
+                            page_text = page_text.strip()
+                            # Remove excessive whitespace
+                            page_text = ' '.join(page_text.split())
+                            text_content.append(f"[Page {page_num + 1}] {page_text}")
+                            pages_processed += 1
+                        
+                        # Limit total extracted text length
+                        current_text = '\n\n'.join(text_content)
+                        if len(current_text) > 8000:  # Stop if we have enough text
+                            break
+                            
+                    except Exception as e:
+                        self.logger.debug(f"Error extracting page {page_num + 1}: {e}")
+                        continue
+                
+                if pages_processed == 0:
+                    # Try alternative extraction method
+                    return self._extract_pdf_text_fallback(pdf_path)
+                
+                final_text = '\n\n'.join(text_content)
+                
+                if total_pages > max_pages:
+                    final_text += f"\n\n[Note: This PDF has {total_pages} pages total, only first {max_pages} were processed]"
+                
+                return final_text
+                
+        except Exception as e:
+            self.logger.debug(f"pdfplumber extraction failed: {e}")
+            return self._extract_pdf_text_fallback(pdf_path)
+    
+    def _extract_pdf_text_fallback(self, pdf_path: str) -> str:
+        """Fallback PDF text extraction using PyPDF2 if available"""
+        try:
+            import PyPDF2
+            
+            text_content = []
+            with open(pdf_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                max_pages = min(len(pdf_reader.pages), self.config.pdf_max_pages)
+                
+                for page_num in range(max_pages):
+                    try:
+                        page = pdf_reader.pages[page_num]
+                        page_text = page.extract_text()
+                        if page_text and page_text.strip():
+                            text_content.append(f"[Page {page_num + 1}] {page_text.strip()}")
+                    except Exception:
+                        continue
+                
+                return '\n\n'.join(text_content)
+                
+        except ImportError:
+            self.logger.debug("PyPDF2 not available for fallback extraction")
+            return ""
+        except Exception as e:
+            self.logger.debug(f"Fallback PDF extraction failed: {e}")
+            return ""
     
     def _process_image_file(self, file_info: FileInfo) -> None:
         """Process an image file"""
@@ -702,43 +915,6 @@ Respond in JSON format:
             file_info.summary = response[:200] if response else "Processing completed"
             file_info.tags = ["processed"]
     
-    def _save_incremental_results(self) -> None:
-        """Save current processing results after each batch"""
-        try:
-            # Update CSV with current results
-            self._save_csv_summary()
-            
-            # Also update JSON with current state
-            results = {
-                'processing_date': datetime.now().isoformat(),
-                'config': asdict(self.config),
-                'summary': {
-                    'total_files_discovered': len(self.file_index),
-                    'files_processed': len([f for f in self.file_index if f.processed]),
-                    'files_with_summaries': len([f for f in self.file_index if f.summary and f.summary.strip()]),
-                    'encrypted_files_found': len([f for f in self.file_index if f.is_encrypted]),
-                    'errors': len([f for f in self.file_index if f.error]),
-                    'status': 'processing'  # Indicate this is an incremental save
-                },
-                'files': [asdict(file_info) for file_info in self.file_index]
-            }
-            
-            # Save incremental JSON results
-            results_file = os.path.join(self.config.output_dir, 'processing_results.json')
-            with open(results_file, 'w') as f:
-                json.dump(results, f, indent=2)
-            
-            # Log progress
-            processed_count = len([f for f in self.file_index if f.processed])
-            total_processable = len([f for f in self.file_index if f.file_type in ['text', 'image'] and not f.is_encrypted])
-            
-            if total_processable > 0:
-                progress_pct = (processed_count / total_processable) * 100
-                self.logger.info(f"📊 Progress: {processed_count}/{total_processable} files ({progress_pct:.1f}%) - Results updated")
-                
-        except Exception as e:
-            self.logger.warning(f"Could not save incremental results: {e}")
-    
     def save_results(self) -> None:
         """Save final processing results"""
         results = {
@@ -795,7 +971,7 @@ Respond in JSON format:
                     file_info.size,
                     file_info.is_encrypted,
                     file_info.processed,
-                    file_info.summary,  # NEW: Include summary in CSV
+                    file_info.summary,  # Include summary in CSV
                     '; '.join(file_info.tags),
                     '; '.join(file_info.entities),
                     '; '.join(file_info.locations),
@@ -817,6 +993,8 @@ def main():
         log_level=os.getenv('LOG_LEVEL', 'INFO'),
         process_images=os.getenv('PROCESS_IMAGES', 'false').lower() == 'true',
         process_text=os.getenv('PROCESS_TEXT', 'true').lower() == 'true',
+        process_pdfs=os.getenv('PROCESS_PDFS', 'true').lower() == 'true',
+        pdf_max_pages=int(os.getenv('PDF_MAX_PAGES', 10)),
         save_incremental=os.getenv('SAVE_INCREMENTAL', 'true').lower() == 'true'
     )
     
@@ -828,6 +1006,20 @@ def main():
         # Log skip folders for user awareness
         if config.skip_folders:
             processor.logger.info(f"⏭️  Skipping folders containing: {', '.join(config.skip_folders)}")
+        
+        # Log enabled file types
+        enabled_types = []
+        if config.process_text:
+            enabled_types.append("text")
+        if config.process_images:
+            enabled_types.append("images")
+        if config.process_pdfs:
+            enabled_types.append("PDFs")
+        
+        if enabled_types:
+            processor.logger.info(f"📄 Processing file types: {', '.join(enabled_types)}")
+            if config.process_pdfs:
+                processor.logger.info(f"📑 PDF processing: max {config.pdf_max_pages} pages per document")
         
         processor.discover_files()
         processor.process_files()
