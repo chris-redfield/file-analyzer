@@ -42,7 +42,7 @@ An file processing system that uses GenAI models to automatically analyze, tag, 
 |----------|---------|-------------|
 | `USE_OLLAMA` | `true` | Use Ollama (local) vs OpenAI (cloud) |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama server URL |
-| `OLLAMA_MODEL` | `llama3.2-vision` | Ollama model for processing |
+| `OLLAMA_MODEL` | `gemma3` | Ollama model for processing |
 | `OPENAI_API_KEY` | - | Your OpenAI API key |
 | `OPENAI_MODEL` | `gpt-4o` | OpenAI model to use |
 | `MAX_FILE_SIZE` | `52428800` | Maximum file size to process (50MB) |
@@ -53,7 +53,6 @@ An file processing system that uses GenAI models to automatically analyze, tag, 
 ### Priority Folders
 
 The system processes files from these folders first:
-- `~/Screenshots/`
 - `~/Downloads/`
 - `~/Documents/`
 - `~/Pictures/`
@@ -132,7 +131,7 @@ python3 ai_file_processor.py
 ## AI Model Requirements
 
 ### Ollama (Recommended for Privacy)
-- **Model**: `llama3.2-vision` (supports both text and image processing)
+- **Model**: `gemma3` (supports both text and image processing)
 - **Installation**: Automatic via setup script
 - **Benefits**: Local processing, no API costs, privacy-friendly
 
@@ -154,9 +153,8 @@ python3 ai_file_processor.py
 - **Batch processing**: Optimized for efficiency
 
 ### System Requirements
-- **RAM**: 8GB+ recommended for Ollama
+- **GPU RAM**: 8GB+ recommended but depends on model
 - **Storage**: Varies based on model size
-- **CPU**: Multi-core recommended for faster processing
 
 ## Troubleshooting
 
@@ -183,7 +181,7 @@ python3 ai_file_processor.py
 4. **Model not found**:
    ```bash
    # Pull required model
-   ollama pull llama3.2-vision
+   ollama pull gemma3
    ```
 
 ### Debug Mode
@@ -212,22 +210,3 @@ Modify the `_manual_file_discovery()` method to target specific directories.
 
 ### Custom AI Prompts
 Edit the prompt templates in `_process_text_file()` and `_process_image_file()` methods.
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License. See LICENSE file for details.
-
-## Support
-
-For issues, questions, or feature requests:
-1. Check the troubleshooting section
-2. Review the logs in the output directory
-3. Open an issue with detailed information about your setup and the problem
